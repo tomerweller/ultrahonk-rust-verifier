@@ -1,9 +1,8 @@
 use crate::field::Fr;
 use crate::types::G1Point;
-use ark_ff::{BigInteger256, PrimeField};
 
-#[cfg(not(feature = "std"))]
-use alloc::{format, string::String};
+#[cfg(feature = "std")]
+use ark_ff::{BigInteger256, PrimeField};
 
 /// trace! macro is a lightweight debug print macro that only outputs when the `trace` feature is enabled.
 /// you can use it like this: cargo test --features trace -- --nocapture / cargo run --features trace
@@ -17,36 +16,43 @@ macro_rules! trace {
     };
 }
 
-/// BigInteger256 → BE fixed-width hex (0x + 64 nibbles)
-/// This is used to convert the internal representation of Fr to a hex string.
-#[inline(always)]
-fn bigint256_to_hex(b: &BigInteger256) -> String {
-    let mut s = String::from("0x");
-    for limb in b.0.iter().rev() {
-        s.push_str(&format!("{:016x}", limb));
+#[cfg(feature = "std")]
+mod debug_helpers {
+    use super::*;
+
+    /// BigInteger256 → BE fixed-width hex (0x + 64 nibbles)
+    /// This is used to convert the internal representation of Fr to a hex string.
+    #[inline(always)]
+    fn bigint256_to_hex(b: &BigInteger256) -> String {
+        let mut s = String::from("0x");
+        for limb in b.0.iter().rev() {
+            s.push_str(&format!("{:016x}", limb));
+        }
+        s
     }
-    s
-}
 
-/// ark_bn254::Fr → BE fixed-width hex (0x + 64 nibbles)
-#[inline(always)]
-pub fn fr_to_hex(fr: &Fr) -> String {
-    bigint256_to_hex(&fr.0.into_bigint())
-}
+    /// ark_bn254::Fr → BE fixed-width hex (0x + 64 nibbles)
+    #[inline(always)]
+    pub fn fr_to_hex(fr: &Fr) -> String {
+        bigint256_to_hex(&fr.0.into_bigint())
+    }
 
-/// G1Point → (x_hex, y_hex)
-#[inline(always)]
-pub fn g1_to_hex(pt: &G1Point) -> (String, String) {
-    (
-        bigint256_to_hex(&pt.x.into_bigint()),
-        bigint256_to_hex(&pt.y.into_bigint()),
-    )
+    /// G1Point → (x_hex, y_hex)
+    #[inline(always)]
+    pub fn g1_to_hex(pt: &G1Point) -> (String, String) {
+        (
+            bigint256_to_hex(&pt.x.into_bigint()),
+            bigint256_to_hex(&pt.y.into_bigint()),
+        )
+    }
 }
 
 /// Outputs commitment/scalar pairs
 pub fn dump_pairs(coms: &[G1Point], scalars: &[Fr], head_tail: usize) {
-    #[cfg(feature = "trace")]
+    #[cfg(all(feature = "trace", feature = "std"))]
     {
+        use debug_helpers::*;
+
         assert_eq!(
             coms.len(),
             scalars.len(),
@@ -74,7 +80,7 @@ pub fn dump_pairs(coms: &[G1Point], scalars: &[Fr], head_tail: usize) {
         }
         trace!("================================");
     }
-    #[cfg(not(feature = "trace"))]
+    #[cfg(not(all(feature = "trace", feature = "std")))]
     {
         let _ = (coms, scalars, head_tail);
     }
@@ -84,8 +90,10 @@ pub fn dump_pairs(coms: &[G1Point], scalars: &[Fr], head_tail: usize) {
 /// cross-checking against Solidity's first 40 entities (1..=40).
 #[allow(dead_code)]
 pub fn dump_pairs_range(coms: &[G1Point], scalars: &[Fr], start: usize, end_inclusive: usize) {
-    #[cfg(feature = "trace")]
+    #[cfg(all(feature = "trace", feature = "std"))]
     {
+        use debug_helpers::*;
+
         assert_eq!(
             coms.len(),
             scalars.len(),
@@ -107,7 +115,7 @@ pub fn dump_pairs_range(coms: &[G1Point], scalars: &[Fr], start: usize, end_incl
         }
         trace!("========================================");
     }
-    #[cfg(not(feature = "trace"))]
+    #[cfg(not(all(feature = "trace", feature = "std")))]
     {
         let _ = (coms, scalars, start, end_inclusive);
     }
@@ -116,7 +124,7 @@ pub fn dump_pairs_range(coms: &[G1Point], scalars: &[Fr], start: usize, end_incl
 /// Debug Fr vector with hex output
 #[inline(always)]
 pub fn dbg_vec(tag: &str, xs: &[Fr]) {
-    #[cfg(feature = "trace")]
+    #[cfg(all(feature = "trace", feature = "std"))]
     {
         for (i, v) in xs.iter().enumerate() {
             trace!(
@@ -127,7 +135,7 @@ pub fn dbg_vec(tag: &str, xs: &[Fr]) {
             );
         }
     }
-    #[cfg(not(feature = "trace"))]
+    #[cfg(not(all(feature = "trace", feature = "std")))]
     {
         let _ = (tag, xs);
     }
@@ -136,11 +144,11 @@ pub fn dbg_vec(tag: &str, xs: &[Fr]) {
 /// Debug Fr with hex output
 #[inline(always)]
 pub fn dbg_fr(tag: &str, x: &Fr) {
-    #[cfg(feature = "trace")]
+    #[cfg(all(feature = "trace", feature = "std"))]
     {
         trace!("{:<18}: 0x{}", tag, hex::encode(x.to_bytes()));
     }
-    #[cfg(not(feature = "trace"))]
+    #[cfg(not(all(feature = "trace", feature = "std")))]
     {
         let _ = (tag, x);
     }

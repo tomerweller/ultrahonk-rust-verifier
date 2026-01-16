@@ -2,21 +2,55 @@ use ark_bn254::Fr as ArkFr;
 use ark_ff::BigInteger256;
 use ark_ff::{Field, PrimeField, Zero};
 use core::ops::{Add, Mul, Neg, Sub};
-use hex;
 
-#[cfg(not(feature = "std"))]
-use alloc::{borrow::ToOwned, string::String};
+/// Maximum hex string length we support (64 chars + 2 for "0x" prefix)
+const MAX_HEX_LEN: usize = 66;
+
+/// Normalize hex string to fixed buffer and return slice
+/// Handles 0x prefix and odd-length hex strings
+#[inline(always)]
+fn decode_hex_to_bytes(s: &str, out: &mut [u8; 32]) -> usize {
+    let raw = s.strip_prefix("0x").unwrap_or(s);
+    let raw = raw.strip_prefix("0X").unwrap_or(raw);
+
+    // Use a fixed buffer for hex normalization
+    let mut hex_buf = [0u8; MAX_HEX_LEN];
+    let raw_bytes = raw.as_bytes();
+    let raw_len = raw_bytes.len().min(64); // Max 64 hex chars for 32 bytes
+
+    // If odd length, prepend a '0'
+    let (hex_slice, hex_len) = if raw_len & 1 == 1 {
+        hex_buf[0] = b'0';
+        hex_buf[1..=raw_len].copy_from_slice(&raw_bytes[..raw_len]);
+        (&hex_buf[..raw_len + 1], raw_len + 1)
+    } else {
+        hex_buf[..raw_len].copy_from_slice(&raw_bytes[..raw_len]);
+        (&hex_buf[..raw_len], raw_len)
+    };
+
+    // Decode hex to bytes
+    let byte_len = hex_len / 2;
+    let mut temp = [0u8; 32];
+    for i in 0..byte_len {
+        let hi = hex_char_to_nibble(hex_slice[i * 2]);
+        let lo = hex_char_to_nibble(hex_slice[i * 2 + 1]);
+        temp[i] = (hi << 4) | lo;
+    }
+
+    // Pad to 32 bytes (right-aligned, big-endian)
+    let offset = 32 - byte_len;
+    out[offset..].copy_from_slice(&temp[..byte_len]);
+
+    byte_len
+}
 
 #[inline(always)]
-fn normalize_hex(s: &str) -> String {
-    let raw = s.trim_start_matches("0x");
-    if raw.len() & 1 == 1 {
-        let mut out = String::with_capacity(raw.len() + 1);
-        out.push('0');
-        out.push_str(raw);
-        out
-    } else {
-        raw.to_owned()
+fn hex_char_to_nibble(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        b'A'..=b'F' => c - b'A' + 10,
+        _ => 0, // Invalid char treated as 0
     }
 }
 
@@ -30,12 +64,10 @@ impl Fr {
     }
 
     /// Construct from hex string (with or without 0x prefix).
-    /// Normalize to even digits before `hex::decode` so OddLength exception won't occur.
+    /// Normalize to even digits before decoding so OddLength exception won't occur.
     pub fn from_str(s: &str) -> Self {
-        let bytes = hex::decode(normalize_hex(s)).expect("hex decode failed");
         let mut padded = [0u8; 32];
-        let offset = 32 - bytes.len();
-        padded[offset..].copy_from_slice(&bytes);
+        decode_hex_to_bytes(s, &mut padded);
         Self::from_bytes(&padded)
     }
 

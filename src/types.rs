@@ -1,5 +1,4 @@
 use crate::field::Fr;
-use ark_bn254::{Fq, G1Affine};
 
 pub const CONST_PROOF_SIZE_LOG_N: usize = 28;
 pub const NUMBER_OF_SUBRELATIONS: usize = 26;
@@ -9,6 +8,26 @@ pub const NUMBER_UNSHIFTED: usize = 35;
 pub const NUMBER_TO_BE_SHIFTED: usize = 5;
 pub const PAIRING_POINTS_SIZE: usize = 16;
 pub const NUMBER_OF_ALPHAS: usize = NUMBER_OF_SUBRELATIONS - 1;
+
+/// G1 point size in bytes (x: 32 bytes, y: 32 bytes)
+pub const G1_POINT_SIZE: usize = 64;
+
+/// G2 point size in bytes (x: 64 bytes, y: 64 bytes for Fp2 coordinates)
+pub const G2_POINT_SIZE: usize = 128;
+
+/// BN254 G1 generator point (big-endian encoding)
+pub const G1_GENERATOR: [u8; 64] = [
+    // x = 1
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    // y = 2
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+];
 
 /// Wire indices for the Ultra Honk protocol.
 #[derive(Copy, Clone, Debug)]
@@ -61,22 +80,36 @@ impl Wire {
     }
 }
 
-/// A G1 point in affine coordinates.
-#[derive(Clone, Debug)]
+/// A G1 point stored as 64 bytes (big-endian: x || y)
+/// This is directly compatible with Soroban's Bn254G1Affine format.
+#[derive(Clone, Copy, Debug)]
 pub struct G1Point {
-    pub x: Fq,
-    pub y: Fq,
+    pub bytes: [u8; G1_POINT_SIZE],
 }
 
 impl G1Point {
-    /// Convert an ark_ec-affine point into our wrapper.
-    pub fn from_affine(pt: &G1Affine) -> Self {
-        G1Point { x: pt.x, y: pt.y }
+    /// Create a new G1Point from bytes
+    #[inline(always)]
+    pub fn from_bytes(bytes: [u8; G1_POINT_SIZE]) -> Self {
+        G1Point { bytes }
     }
 
-    /// Convert back to ark_ec-affine for pairing.
-    pub fn to_affine(&self) -> G1Affine {
-        G1Affine::new(self.x, self.y)
+    /// Create a zero/identity point (all zeros)
+    #[inline(always)]
+    pub fn zero() -> Self {
+        G1Point { bytes: [0u8; G1_POINT_SIZE] }
+    }
+
+    /// Get the X coordinate bytes (first 32 bytes)
+    #[inline(always)]
+    pub fn x_bytes(&self) -> &[u8; 32] {
+        self.bytes[..32].try_into().unwrap()
+    }
+
+    /// Get the Y coordinate bytes (last 32 bytes)
+    #[inline(always)]
+    pub fn y_bytes(&self) -> &[u8; 32] {
+        self.bytes[32..].try_into().unwrap()
     }
 }
 

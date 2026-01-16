@@ -1,53 +1,99 @@
-//! Utilities for loading Proof and VerificationKey, plus byte↔field/point conversion.
+//! Utilities for loading Proof and VerificationKey (no arkworks EC types, no BigUint).
 
 use crate::field::Fr;
 use crate::types::{
     G1Point, Proof, VerificationKey, BATCHED_RELATION_PARTIAL_LENGTH, CONST_PROOF_SIZE_LOG_N,
-    NUMBER_OF_ENTITIES, PAIRING_POINTS_SIZE,
+    G1_POINT_SIZE, NUMBER_OF_ENTITIES, PAIRING_POINTS_SIZE,
 };
 use crate::PROOF_BYTES;
-use ark_bn254::{Fq, G1Affine};
-use ark_ff::{BigInteger256, PrimeField, Zero};
 use core::array;
-use num_bigint::BigUint;
-
-/// BigUint -> Fq by LE bytes (auto-reduced mod p)
-fn biguint_to_fq_mod(x: &BigUint) -> Fq {
-    let le = x.to_bytes_le();
-    Fq::from_le_bytes_mod_order(&le)
-}
 
 /// Convert a 32-byte big-endian array into an Fr.
+#[inline(always)]
 fn bytes32_to_fr(bytes: &[u8; 32]) -> Fr {
     Fr::from_bytes(bytes)
 }
 
-/// Fq to 32-byte big-endian
-pub fn fq_to_be_bytes(f: &Fq) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    let bi: BigInteger256 = (*f).into(); // 4 × 64-bit limbs (LE)
-    for (i, limb) in bi.0.iter().rev().enumerate() {
-        out[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_be_bytes());
-    }
-    out
+/// Split a 32-byte BE field element into (lo136, hi118) each as 32-byte BE.
+/// This is used for transcript hashing to match the Barretenberg split-limb format.
+pub fn bytes32_to_halves_be(bytes: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    // 136 bits = 17 bytes, 118 bits = 15 bytes (rounded up)
+    // In BE 32-byte array:
+    // - lo136 is bits 0-135, which occupy bytes 15-31 (17 bytes)
+    // - hi118 is bits 136-253, which occupy bytes 0-14 (15 bytes) after masking
+
+    let mut lo = [0u8; 32];
+    let mut hi = [0u8; 32];
+
+    // lo136: copy bytes 15-31 (the lower 17 bytes = 136 bits)
+    lo[15..32].copy_from_slice(&bytes[15..32]);
+
+    // hi118: copy bytes 0-14 (the upper 15 bytes, but we need to shift right by the bit offset)
+    // Since 136 = 17*8 exactly, there's no bit offset - we just take bytes 0-14
+    // But we need to right-align them in the output (put in bytes 17-31)
+    hi[17..32].copy_from_slice(&bytes[0..15]);
+
+    (lo, hi)
 }
 
-/// Fq to (low136, high(<=118)) each 32-byte BE
-pub fn fq_to_halves_be(f: &Fq) -> ([u8; 32], [u8; 32]) {
-    let be = fq_to_be_bytes(f);
-    let big = BigUint::from_bytes_be(&be);
-    let mask = (BigUint::from(1u8) << 136) - 1u8; // 2^136 − 1
-    let low = &big & &mask; // lower 136 bits
-    let high = &big >> 136; // upper bits
+/// Recombine split-limb format back to a 32-byte BE field element.
+/// Input: 64 bytes as [lo_be(32)] [hi_be(32)] where:
+/// - lo is the lower 136 bits (right-aligned in 32 bytes)
+/// - hi is the upper 118 bits (right-aligned in 32 bytes)
+/// Output: full 254-bit value as 32-byte BE = lo + (hi << 136)
+#[inline(always)]
+fn recombine_split_limbs(lo: &[u8], hi: &[u8]) -> [u8; 32] {
+    debug_assert!(lo.len() == 32 && hi.len() == 32);
+    let mut result = [0u8; 32];
 
-    fn to_arr(x: BigUint) -> [u8; 32] {
-        let mut arr = [0u8; 32];
-        let bytes = x.to_bytes_be();
-        arr[32 - bytes.len()..].copy_from_slice(&bytes);
-        arr
-    }
+    // lo136 occupies bits 0-135 → result bytes 15-31 (17 bytes)
+    // lo is right-aligned in 32 bytes, so meaningful data is in lo[15..32]
+    result[15..32].copy_from_slice(&lo[15..32]);
 
-    (to_arr(low), to_arr(high))
+    // hi118 << 136 occupies bits 136-253 → result bytes 0-14 (15 bytes)
+    // hi is right-aligned in 32 bytes, so meaningful data is in hi[17..32]
+    result[0..15].copy_from_slice(&hi[17..32]);
+
+    result
+}
+
+/// Parse a G1 point from proof format (split-limb encoding: 128 bytes total).
+/// Format: [x_lo(32), x_hi(32), y_lo(32), y_hi(32)]
+#[inline(always)]
+fn bytes_to_g1_proof_point(bytes: &[u8], cur: &mut usize) -> G1Point {
+    let x_lo = &bytes[*cur..*cur + 32];
+    let x_hi = &bytes[*cur + 32..*cur + 64];
+    let y_lo = &bytes[*cur + 64..*cur + 96];
+    let y_hi = &bytes[*cur + 96..*cur + 128];
+    *cur += 128;
+
+    let x_bytes = recombine_split_limbs(x_lo, x_hi);
+    let y_bytes = recombine_split_limbs(y_lo, y_hi);
+
+    let mut point_bytes = [0u8; G1_POINT_SIZE];
+    point_bytes[..32].copy_from_slice(&x_bytes);
+    point_bytes[32..].copy_from_slice(&y_bytes);
+
+    G1Point::from_bytes(point_bytes)
+}
+
+/// Parse a G1 point from VK format (direct encoding: 64 bytes, x || y).
+#[inline(always)]
+fn read_vk_point(bytes: &[u8], idx: &mut usize) -> G1Point {
+    let mut point_bytes = [0u8; G1_POINT_SIZE];
+    point_bytes.copy_from_slice(&bytes[*idx..*idx + 64]);
+    *idx += 64;
+    // No validation - Soroban host will validate when used in EC operations
+    G1Point::from_bytes(point_bytes)
+}
+
+/// Helper: read next 32 bytes as Fr
+#[inline(always)]
+fn bytes_to_fr(bytes: &[u8], cur: &mut usize) -> Fr {
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes[*cur..*cur + 32]);
+    *cur += 32;
+    bytes32_to_fr(&arr)
 }
 
 /// Load a Proof from a byte array.
@@ -57,29 +103,6 @@ pub fn fq_to_halves_be(f: &Fq) -> ([u8; 32], [u8; 32]) {
 pub fn load_proof(proof_bytes: &[u8]) -> Proof {
     assert_eq!(proof_bytes.len(), PROOF_BYTES, "proof bytes len");
     let mut boundary = 0usize;
-
-    fn bytes_to_g1_proof_point(bytes: &[u8], cur: &mut usize) -> G1Point {
-        use num_bigint::BigUint;
-        let x0 = BigUint::from_bytes_be(&bytes[*cur..*cur + 32]);
-        let x1 = BigUint::from_bytes_be(&bytes[*cur + 32..*cur + 64]);
-        let y0 = BigUint::from_bytes_be(&bytes[*cur + 64..*cur + 96]);
-        let y1 = BigUint::from_bytes_be(&bytes[*cur + 96..*cur + 128]);
-        *cur += 128;
-        let shift = 136u32;
-        let bx = &x0 | (&x1 << shift);
-        let by = &y0 | (&y1 << shift);
-        let fx = biguint_to_fq_mod(&bx);
-        let fy = biguint_to_fq_mod(&by);
-        G1Point { x: fx, y: fy }
-    }
-
-    // Helper: bytesToFr (read next 32 bytes as Fr)
-    fn bytes_to_fr(bytes: &[u8], cur: &mut usize) -> Fr {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes[*cur..*cur + 32]);
-        *cur += 32;
-        bytes32_to_fr(&arr)
-    }
 
     // 0) pairing point object
     let pairing_point_object: [Fr; PAIRING_POINTS_SIZE] =
@@ -145,7 +168,8 @@ pub fn load_proof(proof_bytes: &[u8]) -> Proof {
     }
 }
 
-/// Load a VerificationKey.
+/// Load a VerificationKey from bytes.
+/// No validation is performed - Soroban host will validate points when used.
 pub fn load_vk_from_bytes(bytes: &[u8]) -> Option<VerificationKey> {
     const HEADER_WORDS: usize = 4;
     const NUM_POINTS: usize = 27;
@@ -160,26 +184,6 @@ pub fn load_vk_from_bytes(bytes: &[u8]) -> Option<VerificationKey> {
         *idx += 8;
         u64::from_be_bytes(arr)
     }
-    fn read_point(bytes: &[u8], idx: &mut usize) -> Option<G1Point> {
-        let mut x_bytes = [0u8; 32];
-        let mut y_bytes = [0u8; 32];
-        x_bytes.copy_from_slice(&bytes[*idx..*idx + 32]);
-        y_bytes.copy_from_slice(&bytes[*idx + 32..*idx + 64]);
-        *idx += 64;
-
-        let x = Fq::from_be_bytes_mod_order(&x_bytes);
-        let y = Fq::from_be_bytes_mod_order(&y_bytes);
-
-        if x.is_zero() && y.is_zero() {
-            return Some(G1Point { x, y });
-        }
-
-        let aff = G1Affine::new_unchecked(x, y);
-        if !aff.is_on_curve() || !aff.is_in_correct_subgroup_assuming_on_curve() {
-            return None;
-        }
-        Some(G1Point { x: aff.x, y: aff.y })
-    }
 
     let mut idx = 0usize;
     let circuit_size = read_u64(bytes, &mut idx);
@@ -187,33 +191,33 @@ pub fn load_vk_from_bytes(bytes: &[u8]) -> Option<VerificationKey> {
     let public_inputs_size = read_u64(bytes, &mut idx);
     let _pub_inputs_offset = read_u64(bytes, &mut idx);
 
-    let qm = read_point(bytes, &mut idx)?;
-    let qc = read_point(bytes, &mut idx)?;
-    let ql = read_point(bytes, &mut idx)?;
-    let qr = read_point(bytes, &mut idx)?;
-    let qo = read_point(bytes, &mut idx)?;
-    let q4 = read_point(bytes, &mut idx)?;
-    let q_lookup = read_point(bytes, &mut idx)?;
-    let q_arith = read_point(bytes, &mut idx)?;
-    let q_delta_range = read_point(bytes, &mut idx)?;
-    let q_elliptic = read_point(bytes, &mut idx)?;
-    let q_aux = read_point(bytes, &mut idx)?;
-    let q_poseidon2_external = read_point(bytes, &mut idx)?;
-    let q_poseidon2_internal = read_point(bytes, &mut idx)?;
-    let s1 = read_point(bytes, &mut idx)?;
-    let s2 = read_point(bytes, &mut idx)?;
-    let s3 = read_point(bytes, &mut idx)?;
-    let s4 = read_point(bytes, &mut idx)?;
-    let id1 = read_point(bytes, &mut idx)?;
-    let id2 = read_point(bytes, &mut idx)?;
-    let id3 = read_point(bytes, &mut idx)?;
-    let id4 = read_point(bytes, &mut idx)?;
-    let t1 = read_point(bytes, &mut idx)?;
-    let t2 = read_point(bytes, &mut idx)?;
-    let t3 = read_point(bytes, &mut idx)?;
-    let t4 = read_point(bytes, &mut idx)?;
-    let lagrange_first = read_point(bytes, &mut idx)?;
-    let lagrange_last = read_point(bytes, &mut idx)?;
+    let qm = read_vk_point(bytes, &mut idx);
+    let qc = read_vk_point(bytes, &mut idx);
+    let ql = read_vk_point(bytes, &mut idx);
+    let qr = read_vk_point(bytes, &mut idx);
+    let qo = read_vk_point(bytes, &mut idx);
+    let q4 = read_vk_point(bytes, &mut idx);
+    let q_lookup = read_vk_point(bytes, &mut idx);
+    let q_arith = read_vk_point(bytes, &mut idx);
+    let q_delta_range = read_vk_point(bytes, &mut idx);
+    let q_elliptic = read_vk_point(bytes, &mut idx);
+    let q_aux = read_vk_point(bytes, &mut idx);
+    let q_poseidon2_external = read_vk_point(bytes, &mut idx);
+    let q_poseidon2_internal = read_vk_point(bytes, &mut idx);
+    let s1 = read_vk_point(bytes, &mut idx);
+    let s2 = read_vk_point(bytes, &mut idx);
+    let s3 = read_vk_point(bytes, &mut idx);
+    let s4 = read_vk_point(bytes, &mut idx);
+    let id1 = read_vk_point(bytes, &mut idx);
+    let id2 = read_vk_point(bytes, &mut idx);
+    let id3 = read_vk_point(bytes, &mut idx);
+    let id4 = read_vk_point(bytes, &mut idx);
+    let t1 = read_vk_point(bytes, &mut idx);
+    let t2 = read_vk_point(bytes, &mut idx);
+    let t3 = read_vk_point(bytes, &mut idx);
+    let t4 = read_vk_point(bytes, &mut idx);
+    let lagrange_first = read_vk_point(bytes, &mut idx);
+    let lagrange_last = read_vk_point(bytes, &mut idx);
 
     Some(VerificationKey {
         circuit_size,

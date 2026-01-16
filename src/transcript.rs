@@ -1,25 +1,54 @@
-//! Fiat–Shamir transcript for UltraHonk
+//! Fiat–Shamir transcript for UltraHonk (no heap allocation)
 
 use crate::trace;
 use crate::{
     field::Fr,
     hash::hash32,
-    types::{Proof, RelationParameters, Transcript, CONST_PROOF_SIZE_LOG_N, NUMBER_OF_ALPHAS},
+    types::{G1Point, Proof, RelationParameters, Transcript, CONST_PROOF_SIZE_LOG_N, NUMBER_OF_ALPHAS},
 };
-use ark_bn254::G1Affine;
 
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+/// Maximum buffer size for transcript hashing (4KB)
+/// This accommodates the largest transcript operation (generate_gemini_r_challenge)
+const MAX_TRANSCRIPT_BUF: usize = 4096;
 
-fn push_point(buf: &mut Vec<u8>, pt: &G1Affine) {
-    // Serialize an Fq coordinate into two bn254::Fr limbs (lo136, hi<=118)
-    use crate::utils::fq_to_halves_be;
-    let (x_lo, x_hi) = fq_to_halves_be(&pt.x);
-    let (y_lo, y_hi) = fq_to_halves_be(&pt.y);
-    buf.extend_from_slice(&x_lo);
-    buf.extend_from_slice(&x_hi);
-    buf.extend_from_slice(&y_lo);
-    buf.extend_from_slice(&y_hi);
+/// Fixed-size buffer for transcript data (no heap allocation)
+struct TranscriptBuf {
+    data: [u8; MAX_TRANSCRIPT_BUF],
+    len: usize,
+}
+
+impl TranscriptBuf {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            data: [0u8; MAX_TRANSCRIPT_BUF],
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn extend(&mut self, bytes: &[u8]) {
+        let new_len = self.len + bytes.len();
+        debug_assert!(new_len <= MAX_TRANSCRIPT_BUF, "transcript buffer overflow");
+        self.data[self.len..new_len].copy_from_slice(bytes);
+        self.len = new_len;
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+}
+
+fn push_point(buf: &mut TranscriptBuf, pt: &G1Point) {
+    // Serialize each coordinate into two bn254::Fr limbs (lo136, hi<=118)
+    use crate::utils::bytes32_to_halves_be;
+    let (x_lo, x_hi) = bytes32_to_halves_be(pt.x_bytes());
+    let (y_lo, y_hi) = bytes32_to_halves_be(pt.y_bytes());
+    buf.extend(&x_lo);
+    buf.extend(&x_hi);
+    buf.extend(&y_lo);
+    buf.extend(&y_hi);
 }
 
 fn split_challenge(challenge: Fr) -> (Fr, Fr) {
@@ -49,23 +78,23 @@ fn generate_eta_challenge(
     public_inputs_size: u64,
     pub_inputs_offset: u64,
 ) -> (Fr, Fr, Fr, Fr) {
-    let mut data = Vec::new();
-    data.extend_from_slice(&u64_to_be32(circuit_size));
-    data.extend_from_slice(&u64_to_be32(public_inputs_size));
-    data.extend_from_slice(&u64_to_be32(pub_inputs_offset));
+    let mut data = TranscriptBuf::new();
+    data.extend(&u64_to_be32(circuit_size));
+    data.extend(&u64_to_be32(public_inputs_size));
+    data.extend(&u64_to_be32(pub_inputs_offset));
     let mut chunks = public_inputs.chunks_exact(32);
     for pi in &mut chunks {
-        data.extend_from_slice(pi);
+        data.extend(pi);
     }
     debug_assert!(chunks.remainder().is_empty());
     for fr in &proof.pairing_point_object {
-        data.extend_from_slice(&fr.to_bytes());
+        data.extend(&fr.to_bytes());
     }
     for w in &[&proof.w1, &proof.w2, &proof.w3] {
-        push_point(&mut data, &w.to_affine());
+        push_point(&mut data, w);
     }
 
-    let previous_challenge = hash_to_fr(&data);
+    let previous_challenge = hash_to_fr(data.as_slice());
     let (eta, eta_two) = split_challenge(previous_challenge);
     let previous_challenge = hash_to_fr(&previous_challenge.to_bytes());
     let (eta_three, _) = split_challenge(previous_challenge);
@@ -74,15 +103,16 @@ fn generate_eta_challenge(
 }
 
 fn generate_beta_and_gamma_challenges(previous_challenge: Fr, proof: &Proof) -> (Fr, Fr, Fr) {
-    let mut data = previous_challenge.to_bytes().to_vec();
+    let mut data = TranscriptBuf::new();
+    data.extend(&previous_challenge.to_bytes());
     for w in &[
         &proof.lookup_read_counts,
         &proof.lookup_read_tags,
         &proof.w4,
     ] {
-        push_point(&mut data, &w.to_affine());
+        push_point(&mut data, w);
     }
-    let next_previous_challenge = hash_to_fr(&data);
+    let next_previous_challenge = hash_to_fr(data.as_slice());
     let (beta, gamma) = split_challenge(next_previous_challenge);
     (beta, gamma, next_previous_challenge)
 }
@@ -91,11 +121,12 @@ fn generate_alpha_challenges(
     previous_challenge: Fr,
     proof: &Proof,
 ) -> ([Fr; NUMBER_OF_ALPHAS], Fr) {
-    let mut data = previous_challenge.to_bytes().to_vec();
+    let mut data = TranscriptBuf::new();
+    data.extend(&previous_challenge.to_bytes());
     for w in &[&proof.lookup_inverses, &proof.z_perm] {
-        push_point(&mut data, &w.to_affine());
+        push_point(&mut data, w);
     }
-    let mut next_previous_challenge = hash_to_fr(&data);
+    let mut next_previous_challenge = hash_to_fr(data.as_slice());
 
     let mut alphas = [Fr::zero(); NUMBER_OF_ALPHAS];
     let (a0, a1) = split_challenge(next_previous_challenge);
@@ -162,50 +193,55 @@ fn generate_sumcheck_challenges(
     let mut next_previous_challenge = previous_challenge;
     let mut sumcheck_challenges = [Fr::zero(); CONST_PROOF_SIZE_LOG_N];
     for r in 0..CONST_PROOF_SIZE_LOG_N {
-        let mut data = next_previous_challenge.to_bytes().to_vec();
+        let mut data = TranscriptBuf::new();
+        data.extend(&next_previous_challenge.to_bytes());
         for &c in proof.sumcheck_univariates[r].iter() {
-            data.extend_from_slice(&c.to_bytes());
+            data.extend(&c.to_bytes());
         }
-        next_previous_challenge = hash_to_fr(&data);
+        next_previous_challenge = hash_to_fr(data.as_slice());
         sumcheck_challenges[r] = split_challenge(next_previous_challenge).0;
     }
     (sumcheck_challenges, next_previous_challenge)
 }
 
 fn generate_rho_challenge(proof: &Proof, previous_challenge: Fr) -> (Fr, Fr) {
-    let mut data = previous_challenge.to_bytes().to_vec();
+    let mut data = TranscriptBuf::new();
+    data.extend(&previous_challenge.to_bytes());
     for &e in proof.sumcheck_evaluations.iter() {
-        data.extend_from_slice(&e.to_bytes());
+        data.extend(&e.to_bytes());
     }
-    let next_previous_challenge = hash_to_fr(&data);
+    let next_previous_challenge = hash_to_fr(data.as_slice());
     let rho = split_challenge(next_previous_challenge).0;
     (rho, next_previous_challenge)
 }
 
 fn generate_gemini_r_challenge(proof: &Proof, previous_challenge: Fr) -> (Fr, Fr) {
-    let mut data = previous_challenge.to_bytes().to_vec();
+    let mut data = TranscriptBuf::new();
+    data.extend(&previous_challenge.to_bytes());
     for pt in proof.gemini_fold_comms.iter() {
-        push_point(&mut data, &pt.to_affine());
+        push_point(&mut data, pt);
     }
-    let next_previous_challenge = hash_to_fr(&data);
+    let next_previous_challenge = hash_to_fr(data.as_slice());
     let gemini_r = split_challenge(next_previous_challenge).0;
     (gemini_r, next_previous_challenge)
 }
 
 fn generate_shplonk_nu_challenge(proof: &Proof, previous_challenge: Fr) -> (Fr, Fr) {
-    let mut data = previous_challenge.to_bytes().to_vec();
+    let mut data = TranscriptBuf::new();
+    data.extend(&previous_challenge.to_bytes());
     for &a in proof.gemini_a_evaluations.iter() {
-        data.extend_from_slice(&a.to_bytes());
+        data.extend(&a.to_bytes());
     }
-    let next_previous_challenge = hash_to_fr(&data);
+    let next_previous_challenge = hash_to_fr(data.as_slice());
     let shplonk_nu = split_challenge(next_previous_challenge).0;
     (shplonk_nu, next_previous_challenge)
 }
 
 fn generate_shplonk_z_challenge(proof: &Proof, previous_challenge: Fr) -> (Fr, Fr) {
-    let mut data = previous_challenge.to_bytes().to_vec();
-    push_point(&mut data, &proof.shplonk_q.to_affine());
-    let next_previous_challenge = hash_to_fr(&data);
+    let mut data = TranscriptBuf::new();
+    data.extend(&previous_challenge.to_bytes());
+    push_point(&mut data, &proof.shplonk_q);
+    let next_previous_challenge = hash_to_fr(data.as_slice());
     let shplonk_z = split_challenge(next_previous_challenge).0;
     (shplonk_z, next_previous_challenge)
 }

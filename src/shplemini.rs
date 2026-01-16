@@ -1,69 +1,59 @@
-//! Shplemini batch-opening verifier for BN254
-use crate::ec::helpers::{affine_checked, negate};
+//! Shplemini batch-opening verifier for BN254 (no heap allocation)
+use crate::ec::helpers::negate;
 use crate::ec::{g1_msm, pairing_check};
+use crate::error::VerifierError;
 use crate::field::Fr;
 use crate::trace;
 use crate::types::{
-    G1Point, Proof, Transcript, VerificationKey, CONST_PROOF_SIZE_LOG_N, NUMBER_OF_ENTITIES,
-    NUMBER_TO_BE_SHIFTED, NUMBER_UNSHIFTED,
+    G1Point, Proof, Transcript, VerificationKey, G1_GENERATOR, CONST_PROOF_SIZE_LOG_N,
+    NUMBER_OF_ENTITIES, NUMBER_TO_BE_SHIFTED, NUMBER_UNSHIFTED,
 };
-use ark_bn254::{Fq, G1Projective};
-use ark_ec::{CurveGroup, PrimeGroup};
-#[cfg(feature = "trace")]
-use ark_ff::BigInteger;
-use ark_ff::Zero;
 
-#[cfg(not(feature = "std"))]
-use alloc::{format, string::String, vec, vec::Vec};
+/// Total size for scalars and coms arrays:
+/// [0] = shplonk_Q
+/// [1..=40] = VK + proof entities (NUMBER_OF_ENTITIES = 40)
+/// [41..=67] = gemini_fold_comms (CONST_PROOF_SIZE_LOG_N - 1 = 27)
+/// [68] = generator with const_acc scalar
+/// [69] = kzg_quotient with scalar z
+const SHPLEMINI_TOTAL_SIZE: usize = 1 + NUMBER_OF_ENTITIES + CONST_PROOF_SIZE_LOG_N + 1;
 
 /// Shplemini verification
 pub fn verify_shplemini(
     proof: &Proof,
     vk: &VerificationKey,
     tp: &Transcript,
-) -> Result<(), String> {
+) -> Result<(), VerifierError> {
     // 1) r^{2^i}
     let log_n = vk.log_circuit_size as usize;
-    let mut r_pows = Vec::with_capacity(log_n);
-    r_pows.push(tp.gemini_r);
+    let mut r_pows = [Fr::zero(); CONST_PROOF_SIZE_LOG_N];
+    r_pows[0] = tp.gemini_r;
     for i in 1..log_n {
-        r_pows.push(r_pows[i - 1] * r_pows[i - 1]);
+        r_pows[i] = r_pows[i - 1] * r_pows[i - 1];
     }
-    // 2) allocate arrays
-    // Match Solidity sizing: NUMBER_OF_ENTITIES + CONST_PROOF_SIZE_LOG_N + 2
-    // Layout:
-    //   [0]                 = shplonk_Q
-    //   [1..=40]            = VK + proof entities (NUMBER_OF_ENTITIES)
-    //   [41..=67]           = gemini_fold_comms (CONST_PROOF_SIZE_LOG_N - 1 = 27)
-    //   [68]                = generator (1,2) with const_acc scalar
-    //   [69]                = kzg_quotient with scalar z
-    let total = 1 + NUMBER_OF_ENTITIES + CONST_PROOF_SIZE_LOG_N + 1;
+
+    // 2) allocate arrays on stack
+    let total = SHPLEMINI_TOTAL_SIZE;
     trace!("total = {}", total);
-    let mut scalars = vec![Fr::zero(); total];
-    let mut coms = vec![
-        G1Point {
-            x: Fq::zero(),
-            y: Fq::zero()
-        };
-        total
-    ];
+    let mut scalars = [Fr::zero(); SHPLEMINI_TOTAL_SIZE];
+    let mut coms = [G1Point::zero(); SHPLEMINI_TOTAL_SIZE];
 
     // 3) compute shplonk weights
     let pos0 = (tp.shplonk_z - r_pows[0])
         .inverse()
-        .ok_or_else(|| String::from("shplonk denominator (z - r^0) is zero"))?;
+        .ok_or(VerifierError::ShplonkDenomPosZero)?;
     let neg0 = (tp.shplonk_z + r_pows[0])
         .inverse()
-        .ok_or_else(|| String::from("shplonk denominator (z + r^0) is zero"))?;
+        .ok_or(VerifierError::ShplonkDenomNegZero)?;
     let unshifted = pos0 + tp.shplonk_nu * neg0;
     let gemini_r_inv = tp
         .gemini_r
         .inverse()
-        .ok_or_else(|| String::from("gemini_r challenge is zero"))?;
+        .ok_or(VerifierError::GeminiRZero)?;
     let shifted = gemini_r_inv * (pos0 - tp.shplonk_nu * neg0);
+
     // 4) shplonk_Q
     scalars[0] = Fr::one();
-    coms[0] = proof.shplonk_q.clone();
+    coms[0] = proof.shplonk_q;
 
     // 5) weight sumcheck evals
     let mut rho_pow = Fr::one();
@@ -85,12 +75,13 @@ pub fn verify_shplemini(
         eval_acc = eval_acc + (*eval * rho_pow);
         rho_pow = rho_pow * tp.rho;
     }
+
     // 6) load VK & proof
     {
         let mut j = 1;
         macro_rules! push {
             ($f:ident) => {{
-                coms[j] = vk.$f.clone();
+                coms[j] = vk.$f;
                 j += 1;
             }};
         }
@@ -124,38 +115,38 @@ pub fn verify_shplemini(
         push!(lagrange_first);
         push!(lagrange_last);
 
-        coms[j] = proof.w1.clone();
+        coms[j] = proof.w1;
         j += 1;
-        coms[j] = proof.w2.clone();
+        coms[j] = proof.w2;
         j += 1;
-        coms[j] = proof.w3.clone();
+        coms[j] = proof.w3;
         j += 1;
-        coms[j] = proof.w4.clone();
+        coms[j] = proof.w4;
         j += 1;
-        coms[j] = proof.z_perm.clone();
+        coms[j] = proof.z_perm;
         j += 1;
-        coms[j] = proof.lookup_inverses.clone();
+        coms[j] = proof.lookup_inverses;
         j += 1;
-        coms[j] = proof.lookup_read_counts.clone();
+        coms[j] = proof.lookup_read_counts;
         j += 1;
-        coms[j] = proof.lookup_read_tags.clone();
+        coms[j] = proof.lookup_read_tags;
         j += 1;
 
-        coms[j] = proof.w1.clone();
+        coms[j] = proof.w1;
         j += 1;
-        coms[j] = proof.w2.clone();
+        coms[j] = proof.w2;
         j += 1;
-        coms[j] = proof.w3.clone();
+        coms[j] = proof.w3;
         j += 1;
-        coms[j] = proof.w4.clone();
+        coms[j] = proof.w4;
         j += 1;
-        coms[j] = proof.z_perm.clone();
+        coms[j] = proof.z_perm;
         j += 1;
         let _ = j; // silence "assigned but never read" in non-trace builds
     }
 
     // 7) folding rounds
-    let mut fold_pos = vec![Fr::zero(); log_n];
+    let mut fold_pos = [Fr::zero(); CONST_PROOF_SIZE_LOG_N];
     let mut cur = eval_acc;
     for j in (1..=log_n).rev() {
         let r2 = r_pows[j - 1];
@@ -163,25 +154,25 @@ pub fn verify_shplemini(
         let num = r2 * cur * Fr::from_u64(2)
             - proof.gemini_a_evaluations[j - 1] * (r2 * (Fr::one() - u) - u);
         let den = r2 * (Fr::one() - u) + u;
-        let den_inv = den
-            .inverse()
-            .ok_or_else(|| format!("fold round {} denominator is zero", j))?;
+        let den_inv = den.inverse().ok_or(VerifierError::FoldRoundDenomZero)?;
         cur = num * den_inv;
         fold_pos[j - 1] = cur;
     }
+
     // 8) accumulate constant term
     let mut const_acc = fold_pos[0] * pos0 + proof.gemini_a_evaluations[0] * tp.shplonk_nu * neg0;
     let mut v_pow = tp.shplonk_nu * tp.shplonk_nu;
+
     // 9) further folding + commit
     // Base index where fold commitments start
     let base = 1 + NUMBER_OF_ENTITIES;
     for j in 1..log_n {
         let pos_inv = (tp.shplonk_z - r_pows[j])
             .inverse()
-            .ok_or_else(|| format!("shplonk denominator (z - r^{}) is zero", j))?;
+            .ok_or(VerifierError::ShplonkDenomPosZero)?;
         let neg_inv = (tp.shplonk_z + r_pows[j])
             .inverse()
-            .ok_or_else(|| format!("shplonk denominator (z + r^{}) is zero", j))?;
+            .ok_or(VerifierError::ShplonkDenomNegZero)?;
         let sp = v_pow * pos_inv;
         let sn = v_pow * tp.shplonk_nu * neg_inv;
 
@@ -190,34 +181,33 @@ pub fn verify_shplemini(
 
         v_pow = v_pow * tp.shplonk_nu * tp.shplonk_nu;
 
-        coms[base + j - 1] = proof.gemini_fold_comms[j - 1].clone();
+        coms[base + j - 1] = proof.gemini_fold_comms[j - 1];
     }
 
     // Fill remaining (dummy) fold commitments so MSM layout matches Solidity (total 27 entries)
     for i in (log_n - 1)..(CONST_PROOF_SIZE_LOG_N - 1) {
-        coms[base + i] = proof.gemini_fold_comms[i].clone();
+        coms[base + i] = proof.gemini_fold_comms[i];
     }
 
     // 10) add generator
     // Generator goes right after all fold commitments (27 entries)
     let one_idx = base + (CONST_PROOF_SIZE_LOG_N - 1);
     trace!("one_idx = {}", one_idx);
-    let gen = G1Projective::generator().into_affine();
-    coms[one_idx] = G1Point { x: gen.x, y: gen.y };
+    coms[one_idx] = G1Point::from_bytes(G1_GENERATOR);
     scalars[one_idx] = const_acc;
 
     // 11) add quotient
     let q_idx = one_idx + 1;
     trace!("q_idx = {}", q_idx);
-    coms[q_idx] = proof.kzg_quotient.clone();
+    coms[q_idx] = proof.kzg_quotient;
     scalars[q_idx] = tp.shplonk_z;
 
     // 12) MSM + pairing
-    let p0 = g1_msm(&coms, &scalars)?;
-    let p1 = affine_checked(&negate(&proof.kzg_quotient))?;
+    let p0 = g1_msm(&coms[..total], &scalars[..total])?;
+    let p1 = negate(&proof.kzg_quotient);
     if pairing_check(&p0, &p1) {
         Ok(())
     } else {
-        Err("Shplonk pairing check failed".into())
+        Err(VerifierError::ShplonkPairingFailed)
     }
 }

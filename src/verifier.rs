@@ -1,6 +1,7 @@
-//! UltraHonk verifier
+//! UltraHonk verifier (no heap allocation)
 
 use crate::{
+    error::VerifierError,
     field::Fr,
     shplemini::verify_shplemini,
     sumcheck::verify_sumcheck,
@@ -8,28 +9,6 @@ use crate::{
     types::PAIRING_POINTS_SIZE,
     utils::{load_proof, load_vk_from_bytes},
 };
-
-#[cfg(not(feature = "std"))]
-use alloc::{format, string::String};
-
-/// Error type describing the specific reason verification failed.
-#[derive(Debug)]
-pub enum VerifyError {
-    InvalidInput(String),
-    SumcheckFailed(String),
-    ShplonkFailed(String),
-}
-
-/// Allow converting VerifyError into a String for debugging and logging.
-impl From<VerifyError> for String {
-    fn from(err: VerifyError) -> String {
-        match err {
-            VerifyError::InvalidInput(s) => format!("invalid input: {}", s),
-            VerifyError::SumcheckFailed(s) => format!("sumcheck failed: {}", s),
-            VerifyError::ShplonkFailed(s) => format!("shplonk failed: {}", s),
-        }
-    }
-}
 
 pub struct UltraHonkVerifier {
     vk: crate::types::VerificationKey,
@@ -54,24 +33,22 @@ impl UltraHonkVerifier {
         &self,
         proof_bytes: &[u8],
         public_inputs_bytes: &[u8],
-    ) -> Result<(), VerifyError> {
+    ) -> Result<(), VerifierError> {
         // 1) parse proof
         let proof = load_proof(proof_bytes);
 
         // 2) sanity on public inputs (length and VK metadata if present)
         if public_inputs_bytes.len() % 32 != 0 {
-            return Err(VerifyError::InvalidInput(
-                "public inputs must be 32-byte aligned".into(),
-            ));
+            return Err(VerifierError::PublicInputsNotAligned);
         }
         let provided = (public_inputs_bytes.len() / 32) as u64;
         let expected = self
             .vk
             .public_inputs_size
             .checked_sub(PAIRING_POINTS_SIZE as u64)
-            .ok_or_else(|| VerifyError::InvalidInput("vk inputs < 16".into()))?;
+            .ok_or(VerifierError::VkInputsTooSmall)?;
         if expected != provided {
-            return Err(VerifyError::InvalidInput("public inputs mismatch".into()));
+            return Err(VerifierError::PublicInputsMismatch);
         }
 
         // 3) Fiat–Shamir transcript
@@ -93,14 +70,13 @@ impl UltraHonkVerifier {
             t.rel_params.gamma,
             pub_inputs_offset,
             self.vk.circuit_size,
-        )
-        .map_err(VerifyError::InvalidInput)?;
+        )?;
 
         // 5) Sum-check
-        verify_sumcheck(&proof, &t, &self.vk).map_err(VerifyError::SumcheckFailed)?;
+        verify_sumcheck(&proof, &t, &self.vk)?;
 
         // 6) Shplonk
-        verify_shplemini(&proof, &self.vk, &t).map_err(VerifyError::ShplonkFailed)?;
+        verify_shplemini(&proof, &self.vk, &t)?;
 
         Ok(())
     }
@@ -112,7 +88,7 @@ impl UltraHonkVerifier {
         gamma: Fr,
         offset: u64,
         n: u64,
-    ) -> Result<Fr, String> {
+    ) -> Result<Fr, VerifierError> {
         let mut numerator = Fr::one();
         let mut denominator = Fr::one();
 
@@ -136,7 +112,7 @@ impl UltraHonkVerifier {
         }
         let denominator_inv = denominator
             .inverse()
-            .ok_or_else(|| String::from("public input delta denom is zero"))?;
+            .ok_or(VerifierError::PublicInputDeltaDenomZero)?;
         Ok(numerator * denominator_inv)
     }
 }

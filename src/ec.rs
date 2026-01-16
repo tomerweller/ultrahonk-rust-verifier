@@ -1,204 +1,206 @@
-use crate::{field::Fr, types::G1Point};
+//! BN254 elliptic curve operations for the verifier.
+//! Uses byte-based G1Point directly compatible with Soroban's Bn254G1Affine.
 
-#[cfg(all(feature = "soroban-precompile", not(feature = "std")))]
-use alloc::boxed::Box;
-#[cfg(not(feature = "std"))]
-use alloc::string::String;
-#[cfg(feature = "std")]
-use std::boxed::Box;
+use crate::{error::VerifierError, field::Fr, types::G1Point};
+use crate::types::G2_POINT_SIZE;
 
-use crate::trace;
-use ark_bn254::{Bn254, Fq, Fq2, G1Affine, G1Projective, G2Affine};
-use ark_ec::{pairing::Pairing, CurveGroup, PrimeGroup};
-#[cfg(feature = "trace")]
-use ark_ff::BigInteger;
-use ark_ff::{One, PrimeField, Zero};
+/// BN254 base field modulus (Fq) in big-endian
+/// p = 21888242871839275222246405745257275088696311157297823662689037894645226208583
+const FQ_MODULUS: [u8; 32] = [
+    0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29,
+    0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58, 0x5d,
+    0x97, 0x81, 0x6a, 0x91, 0x68, 0x71, 0xca, 0x8d,
+    0x3c, 0x20, 0x8c, 0x16, 0xd8, 0x7c, 0xfd, 0x47,
+];
 
-#[cfg(feature = "soroban-precompile")]
-use once_cell::race::OnceBox;
+/// RHS G2 point for pairing check (big-endian: x.c1 || x.c0 || y.c1 || y.c0)
+/// This is the second generator point used in the KZG setup.
+pub const RHS_G2_BYTES: [u8; G2_POINT_SIZE] = [
+    // x.c1
+    0x19, 0x8e, 0x93, 0x93, 0x92, 0x0d, 0x48, 0x3a, 0x72, 0x60, 0xbf, 0xb7, 0x31, 0xfb, 0x5d, 0x25,
+    0xf1, 0xaa, 0x49, 0x33, 0x35, 0xa9, 0xe7, 0x12, 0x97, 0xe4, 0x85, 0xb7, 0xae, 0xf3, 0x12, 0xc2,
+    // x.c0
+    0x18, 0x00, 0xde, 0xef, 0x12, 0x1f, 0x1e, 0x76, 0x42, 0x6a, 0x00, 0x66, 0x5e, 0x5c, 0x44, 0x79,
+    0x67, 0x43, 0x22, 0xd4, 0xf7, 0x5e, 0xda, 0xdd, 0x46, 0xde, 0xbd, 0x5c, 0xd9, 0x92, 0xf6, 0xed,
+    // y.c1
+    0x09, 0x06, 0x89, 0xd0, 0x58, 0x5f, 0xf0, 0x75, 0xec, 0x9e, 0x99, 0xad, 0x69, 0x0c, 0x33, 0x95,
+    0xbc, 0x4b, 0x31, 0x33, 0x70, 0xb3, 0x8e, 0xf3, 0x55, 0xac, 0xda, 0xdc, 0xd1, 0x22, 0x97, 0x5b,
+    // y.c0
+    0x12, 0xc8, 0x5e, 0xa5, 0xdb, 0x8c, 0x6d, 0xeb, 0x4a, 0xab, 0x71, 0x80, 0x8d, 0xcb, 0x40, 0x8f,
+    0xe3, 0xd1, 0xe7, 0x69, 0x0c, 0x43, 0xd3, 0x7b, 0x4c, 0xe6, 0xcc, 0x01, 0x66, 0xfa, 0x7d, 0xaa,
+];
+
+/// LHS G2 point for pairing check (big-endian: x.c1 || x.c0 || y.c1 || y.c0)
+/// This is the G2 generator point (negative of the standard generator for pairing equation).
+pub const LHS_G2_BYTES: [u8; G2_POINT_SIZE] = [
+    // x.c1
+    0x26, 0x0e, 0x01, 0xb2, 0x51, 0xf6, 0xf1, 0xc7, 0xe7, 0xff, 0x4e, 0x58, 0x07, 0x91, 0xde, 0xe8,
+    0xea, 0x51, 0xd8, 0x7a, 0x35, 0x8e, 0x03, 0x8b, 0x4e, 0xfe, 0x30, 0xfa, 0xc0, 0x93, 0x83, 0xc1,
+    // x.c0
+    0x01, 0x18, 0xc4, 0xd5, 0xb8, 0x37, 0xbc, 0xc2, 0xbc, 0x89, 0xb5, 0xb3, 0x98, 0xb5, 0x97, 0x4e,
+    0x9f, 0x59, 0x44, 0x07, 0x3b, 0x32, 0x07, 0x8b, 0x7e, 0x23, 0x1f, 0xec, 0x93, 0x88, 0x83, 0xb0,
+    // y.c1
+    0x04, 0xfc, 0x63, 0x69, 0xf7, 0x11, 0x0f, 0xe3, 0xd2, 0x51, 0x56, 0xc1, 0xbb, 0x9a, 0x72, 0x85,
+    0x9c, 0xf2, 0xa0, 0x46, 0x41, 0xf9, 0x9b, 0xa4, 0xee, 0x41, 0x3c, 0x80, 0xda, 0x6a, 0x5f, 0xe4,
+    // y.c0
+    0x22, 0xfe, 0xbd, 0xa3, 0xc0, 0xc0, 0x63, 0x2a, 0x56, 0x47, 0x5b, 0x42, 0x14, 0xe5, 0x61, 0x5e,
+    0x11, 0xe6, 0xdd, 0x3f, 0x96, 0xe6, 0xce, 0xa2, 0x85, 0x4a, 0x87, 0xd4, 0xda, 0xcc, 0x5e, 0x55,
+];
+
+/// Negate a G1 point by computing -y mod p (the BN254 base field modulus).
+/// For the zero point (all zeros), returns the zero point unchanged.
+#[inline(always)]
+pub fn negate(pt: &G1Point) -> G1Point {
+    let mut result = pt.bytes;
+
+    // Extract y coordinate (bytes 32-63)
+    let y = &pt.bytes[32..64];
+
+    // Check if y is zero (point at infinity)
+    let mut is_zero = true;
+    for &b in y {
+        if b != 0 {
+            is_zero = false;
+            break;
+        }
+    }
+
+    if is_zero {
+        return G1Point { bytes: result };
+    }
+
+    // Compute p - y using big-endian subtraction
+    let neg_y = sub_mod(&FQ_MODULUS, y);
+    result[32..64].copy_from_slice(&neg_y);
+
+    G1Point { bytes: result }
+}
+
+/// Subtract b from a (both 32-byte big-endian), assuming a >= b.
+/// Returns a - b as 32-byte big-endian.
+#[inline(always)]
+fn sub_mod(a: &[u8; 32], b: &[u8]) -> [u8; 32] {
+    let mut result = [0u8; 32];
+    let mut borrow: u16 = 0;
+
+    // Process from least significant byte (index 31) to most significant (index 0)
+    for i in (0..32).rev() {
+        let ai = a[i] as u16;
+        let bi = b[i] as u16;
+        let diff = ai.wrapping_sub(bi).wrapping_sub(borrow);
+        result[i] = diff as u8;
+        borrow = if ai < bi + borrow { 1 } else { 0 };
+    }
+
+    result
+}
 
 /// Trait for BN254 operations used by the verifier hot paths.
-/// Implement this to bridge MSM/pairing to a Soroban BN254 precompile.
+/// The implementation bridges MSM/pairing to Soroban BN254 precompiles.
 pub trait Bn254Ops {
-    fn g1_msm(&self, coms: &[G1Point], scalars: &[Fr]) -> Result<G1Affine, String>;
-    fn pairing_check(&self, p0: &G1Affine, p1: &G1Affine) -> bool;
+    fn g1_msm(&self, coms: &[G1Point], scalars: &[Fr]) -> Result<G1Point, VerifierError>;
+    fn pairing_check(&self, p0: &G1Point, p1: &G1Point) -> bool;
 }
 
-#[inline(always)]
-fn affine_checked(pt: &G1Point) -> Result<G1Affine, String> {
-    let aff = G1Affine::new_unchecked(pt.x, pt.y);
-    if aff.is_on_curve() && aff.is_in_correct_subgroup_assuming_on_curve() {
-        Ok(aff)
-    } else {
-        Err("g1 point not on curve".into())
-    }
-}
-
-#[inline(always)]
-fn negate(pt: &G1Point) -> G1Point {
-    G1Point { x: pt.x, y: -pt.y }
-}
-
-#[inline(always)]
-fn ark_g1_msm(coms: &[G1Point], scalars: &[Fr]) -> Result<G1Affine, String> {
-    if coms.len() != scalars.len() {
-        return Err("msm len mismatch".into());
-    }
-    let mut acc = G1Projective::zero();
-    trace!("Initial acc: {:?}", acc);
-    for (c, s) in coms.iter().zip(scalars.iter()) {
-        let aff = G1Affine::new_unchecked(c.x, c.y);
-        if !aff.is_on_curve() || !aff.is_in_correct_subgroup_assuming_on_curve() {
-            return Err("g1 point invalid".into());
-        }
-        #[cfg(feature = "trace")]
-        {
-            trace!(
-                "Point.x = 0x{}",
-                hex::encode(c.x.into_bigint().to_bytes_be())
-            );
-            trace!(
-                "Point.y = 0x{}",
-                hex::encode(c.y.into_bigint().to_bytes_be())
-            );
-            trace!("Scalar  = 0x{}", hex::encode(s.to_bytes()));
-        }
-        acc += G1Projective::from(aff).mul_bigint(s.0.into_bigint());
-        #[cfg(feature = "trace")]
-        {
-            let acc_aff = acc.into_affine();
-            trace!(
-                "Acc.x  = 0x{}",
-                hex::encode(acc_aff.x.into_bigint().to_bytes_be())
-            );
-            trace!(
-                "Acc.y  = 0x{}",
-                hex::encode(acc_aff.y.into_bigint().to_bytes_be())
-            );
-            acc = G1Projective::from(acc_aff);
-        }
-    }
-    Ok(acc.into_affine())
-}
-
-#[inline(always)]
-pub fn rhs_g2_affine() -> G2Affine {
-    let x = Fq2::new(
-        Fq::from_le_bytes_mod_order(&[
-            0xed, 0xf6, 0x92, 0xd9, 0x5c, 0xbd, 0xde, 0x46, 0xdd, 0xda, 0x5e, 0xf7, 0xd4, 0x22,
-            0x43, 0x67, 0x79, 0x44, 0x5c, 0x5e, 0x66, 0x00, 0x6a, 0x42, 0x76, 0x1e, 0x1f, 0x12,
-            0xef, 0xde, 0x00, 0x18,
-        ]),
-        Fq::from_le_bytes_mod_order(&[
-            0xc2, 0x12, 0xf3, 0xae, 0xb7, 0x85, 0xe4, 0x97, 0x12, 0xe7, 0xa9, 0x35, 0x33, 0x49,
-            0xaa, 0xf1, 0x25, 0x5d, 0xfb, 0x31, 0xb7, 0xbf, 0x60, 0x72, 0x3a, 0x48, 0x0d, 0x92,
-            0x93, 0x93, 0x8e, 0x19,
-        ]),
-    );
-    let y = Fq2::new(
-        Fq::from_le_bytes_mod_order(&[
-            0xaa, 0x7d, 0xfa, 0x66, 0x01, 0xcc, 0xe6, 0x4c, 0x7b, 0xd3, 0x43, 0x0c, 0x69, 0xe7,
-            0xd1, 0xe3, 0x8f, 0x40, 0xcb, 0x8d, 0x80, 0x71, 0xab, 0x4a, 0xeb, 0x6d, 0x8c, 0xdb,
-            0xa5, 0x5e, 0xc8, 0x12,
-        ]),
-        Fq::from_le_bytes_mod_order(&[
-            0x5b, 0x97, 0x22, 0xd1, 0xdc, 0xda, 0xac, 0x55, 0xf3, 0x8e, 0xb3, 0x70, 0x33, 0x31,
-            0x4b, 0xbc, 0x95, 0x33, 0x0c, 0x69, 0xad, 0x99, 0x9e, 0xec, 0x75, 0xf0, 0x5f, 0x58,
-            0xd0, 0x89, 0x06, 0x09,
-        ]),
-    );
-    G2Affine::new_unchecked(x, y)
-}
-
-#[inline(always)]
-pub fn lhs_g2_affine() -> G2Affine {
-    let x = Fq2::new(
-        Fq::from_le_bytes_mod_order(&[
-            0xb0, 0x83, 0x88, 0x93, 0xec, 0x1f, 0x23, 0x7e, 0x8b, 0x07, 0x32, 0x3b, 0x07, 0x44,
-            0x59, 0x9f, 0x4e, 0x97, 0xb5, 0x98, 0xb3, 0xb5, 0x89, 0xbc, 0xc2, 0xbc, 0x37, 0xb8,
-            0xd5, 0xc4, 0x18, 0x01,
-        ]),
-        Fq::from_le_bytes_mod_order(&[
-            0xc1, 0x83, 0x93, 0xc0, 0xfa, 0x30, 0xfe, 0x4e, 0x8b, 0x03, 0x8e, 0x35, 0x7a, 0xd8,
-            0x51, 0xea, 0xe8, 0xde, 0x91, 0x07, 0x58, 0x4e, 0xff, 0xe7, 0xc7, 0xf1, 0xf6, 0x51,
-            0xb2, 0x01, 0x0e, 0x26,
-        ]),
-    );
-    let y = Fq2::new(
-        Fq::from_le_bytes_mod_order(&[
-            0x55, 0x5e, 0xcc, 0xda, 0xd4, 0x87, 0x4a, 0x85, 0xa2, 0xce, 0xe6, 0x96, 0x3f, 0xdd,
-            0xe6, 0x11, 0x5e, 0x61, 0xe5, 0x14, 0x42, 0x5b, 0x47, 0x56, 0x2a, 0x63, 0xc0, 0xc0,
-            0xa3, 0xbd, 0xfe, 0x22,
-        ]),
-        Fq::from_le_bytes_mod_order(&[
-            0xe4, 0x5f, 0x6a, 0xda, 0x80, 0x3c, 0x41, 0xee, 0xa4, 0x9b, 0xf9, 0x41, 0x46, 0xa0,
-            0xf2, 0x9c, 0x85, 0x72, 0x9a, 0xbb, 0xc1, 0x56, 0x51, 0xd2, 0xe3, 0x0f, 0x11, 0xf7,
-            0x69, 0x63, 0xfc, 0x04,
-        ]),
-    );
-    G2Affine::new_unchecked(x, y)
-}
-
-#[inline(always)]
-fn ark_pairing_check(p0: &G1Affine, p1: &G1Affine) -> bool {
-    let rhs_g2 = rhs_g2_affine();
-    let lhs_g2 = lhs_g2_affine();
-
-    let e1 = Bn254::pairing(*p0, rhs_g2);
-    let e2 = Bn254::pairing(*p1, lhs_g2);
-    e1.0 * e2.0 == <Bn254 as Pairing>::TargetField::one()
-}
-
-pub struct ArkworksOps;
-
-impl Bn254Ops for ArkworksOps {
-    #[inline(always)]
-    fn g1_msm(&self, coms: &[G1Point], scalars: &[Fr]) -> Result<G1Affine, String> {
-        ark_g1_msm(coms, scalars)
-    }
-    #[inline(always)]
-    fn pairing_check(&self, p0: &G1Affine, p1: &G1Affine) -> bool {
-        ark_pairing_check(p0, p1)
-    }
-}
-
-static ARKWORKS: ArkworksOps = ArkworksOps;
+// ============================================================================
+// Soroban static backend (no allocator, no Box)
+// ============================================================================
 
 #[cfg(feature = "soroban-precompile")]
-struct BackendHolder(pub Box<dyn Bn254Ops + Send + Sync>);
+mod soroban_backend {
+    use super::*;
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(feature = "soroban-precompile")]
-static BACKEND: OnceBox<BackendHolder> = OnceBox::new();
+    /// Static storage for Soroban backend function pointers
+    struct SorobanBackend {
+        initialized: AtomicBool,
+        // Function pointers instead of trait objects
+        msm_fn: UnsafeCell<Option<fn(&[G1Point], &[Fr]) -> Result<G1Point, VerifierError>>>,
+        pairing_fn: UnsafeCell<Option<fn(&G1Point, &G1Point) -> bool>>,
+    }
 
+    unsafe impl Sync for SorobanBackend {}
+
+    static SOROBAN_BACKEND: SorobanBackend = SorobanBackend {
+        initialized: AtomicBool::new(false),
+        msm_fn: UnsafeCell::new(None),
+        pairing_fn: UnsafeCell::new(None),
+    };
+
+    pub fn set_soroban_backend(
+        msm_fn: fn(&[G1Point], &[Fr]) -> Result<G1Point, VerifierError>,
+        pairing_fn: fn(&G1Point, &G1Point) -> bool,
+    ) {
+        unsafe {
+            *SOROBAN_BACKEND.msm_fn.get() = Some(msm_fn);
+            *SOROBAN_BACKEND.pairing_fn.get() = Some(pairing_fn);
+        }
+        SOROBAN_BACKEND.initialized.store(true, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub fn is_initialized() -> bool {
+        SOROBAN_BACKEND.initialized.load(Ordering::Acquire)
+    }
+
+    #[inline(always)]
+    pub fn call_msm(coms: &[G1Point], scalars: &[Fr]) -> Result<G1Point, VerifierError> {
+        unsafe {
+            if let Some(f) = *SOROBAN_BACKEND.msm_fn.get() {
+                f(coms, scalars)
+            } else {
+                Err(VerifierError::EcBackendNotInitialized)
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn call_pairing(p0: &G1Point, p1: &G1Point) -> bool {
+        unsafe {
+            if let Some(f) = *SOROBAN_BACKEND.pairing_fn.get() {
+                f(p0, p1)
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// Multi-scalar multiplication on G1: sum of s_i * C_i
+/// Returns a G1Point (64 bytes, directly compatible with Soroban).
 #[inline(always)]
-fn backend() -> &'static dyn Bn254Ops {
+pub fn g1_msm(coms: &[G1Point], scalars: &[Fr]) -> Result<G1Point, VerifierError> {
     #[cfg(feature = "soroban-precompile")]
     {
-        if let Some(b) = BACKEND.get() {
-            return &*b.0;
+        if soroban_backend::is_initialized() {
+            return soroban_backend::call_msm(coms, scalars);
         }
     }
-    &ARKWORKS
-}
-
-/// Multi-scalar multiplication on G1: ∑ sᵢ·Cᵢ
-#[inline(always)]
-pub fn g1_msm(coms: &[G1Point], scalars: &[Fr]) -> Result<G1Affine, String> {
-    backend().g1_msm(coms, scalars)
+    // If no backend is initialized, return an error
+    // (Soroban-only mode: no fallback to arkworks)
+    Err(VerifierError::EcBackendNotInitialized)
 }
 
 /// Pairing product check e(P0, rhs_g2) * e(P1, lhs_g2) == 1
+/// Takes G1Points directly (64 bytes each).
 #[inline(always)]
-pub fn pairing_check(p0: &G1Affine, p1: &G1Affine) -> bool {
-    backend().pairing_check(p0, p1)
+pub fn pairing_check(p0: &G1Point, p1: &G1Point) -> bool {
+    #[cfg(feature = "soroban-precompile")]
+    {
+        if soroban_backend::is_initialized() {
+            return soroban_backend::call_pairing(p0, p1);
+        }
+    }
+    // If no backend is initialized, return false
+    false
 }
 
+/// Helper functions for EC operations
 pub mod helpers {
     use super::*;
-    #[inline(always)]
-    pub fn affine_checked(pt: &G1Point) -> Result<G1Affine, String> {
-        super::affine_checked(pt)
-    }
+
+    /// Negate a G1 point (compute -P by negating Y coordinate)
     #[inline(always)]
     pub fn negate(pt: &G1Point) -> G1Point {
         super::negate(pt)
@@ -206,13 +208,4 @@ pub mod helpers {
 }
 
 #[cfg(feature = "soroban-precompile")]
-/// Register a custom BN254 backend (Soroban BN254 precompile bridge).
-pub fn set_backend(ops: Box<dyn Bn254Ops + Send + Sync>) {
-    let _ = BACKEND.set(Box::new(BackendHolder(ops)));
-}
-
-#[cfg(feature = "soroban-precompile")]
-#[inline(always)]
-pub fn set_soroban_bn254_backend(ops: Box<dyn Bn254Ops + Send + Sync>) {
-    set_backend(ops)
-}
+pub use soroban_backend::set_soroban_backend;

@@ -1,18 +1,13 @@
 //! Sum-check verifier
 use crate::{
+    error::VerifierError,
     field::Fr,
     relations::accumulate_relation_evaluations,
     types::{Transcript, VerificationKey, BATCHED_RELATION_PARTIAL_LENGTH},
 };
 
-#[cfg(not(feature = "std"))]
-use alloc::string::String;
-
 #[cfg(feature = "std")]
 use lazy_static::lazy_static;
-
-#[cfg(not(feature = "std"))]
-use once_cell::race::OnceBox;
 
 #[cfg(feature = "std")]
 lazy_static! {
@@ -29,23 +24,20 @@ lazy_static! {
     ].map(Fr::from_str);
 }
 
+// For no_std, use inline initialization (computed once per call, but avoids allocator)
 #[cfg(not(feature = "std"))]
-static BARY_BOX: OnceBox<[Fr; BATCHED_RELATION_PARTIAL_LENGTH]> = OnceBox::new();
-
-#[cfg(not(feature = "std"))]
-fn get_bary() -> &'static [Fr; BATCHED_RELATION_PARTIAL_LENGTH] {
-    BARY_BOX.get_or_init(|| {
-        alloc::boxed::Box::new([
-            Fr::from_str("0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593efffec51"),
-            Fr::from_str("0x00000000000000000000000000000000000000000000000000000000000002d0"),
-            Fr::from_str("0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593efffff11"),
-            Fr::from_str("0x0000000000000000000000000000000000000000000000000000000000000090"),
-            Fr::from_str("0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593efffff71"),
-            Fr::from_str("0x00000000000000000000000000000000000000000000000000000000000000f0"),
-            Fr::from_str("0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593effffd31"),
-            Fr::from_str("0x00000000000000000000000000000000000000000000000000000000000013b0"),
-        ])
-    })
+#[inline(always)]
+fn get_bary() -> [Fr; BATCHED_RELATION_PARTIAL_LENGTH] {
+    [
+        Fr::from_str("0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593efffec51"),
+        Fr::from_str("0x00000000000000000000000000000000000000000000000000000000000002d0"),
+        Fr::from_str("0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593efffff11"),
+        Fr::from_str("0x0000000000000000000000000000000000000000000000000000000000000090"),
+        Fr::from_str("0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593efffff71"),
+        Fr::from_str("0x00000000000000000000000000000000000000000000000000000000000000f0"),
+        Fr::from_str("0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593effffd31"),
+        Fr::from_str("0x00000000000000000000000000000000000000000000000000000000000013b0"),
+    ]
 }
 
 /// Check if the sum of two univariates equals the target value
@@ -57,7 +49,7 @@ fn check_sum(round_univariate: &[Fr], round_target: Fr) -> bool {
 
 /// Calculate next target value for the sum-check
 #[inline(always)]
-fn compute_next_target_sum(round_univariate: &[Fr], round_challenge: Fr) -> Result<Fr, String> {
+fn compute_next_target_sum(round_univariate: &[Fr], round_challenge: Fr) -> Result<Fr, VerifierError> {
     // B(χ) = ∏ (χ - i)
     let mut b_poly = Fr::one();
     for i in 0..BATCHED_RELATION_PARTIAL_LENGTH {
@@ -65,15 +57,16 @@ fn compute_next_target_sum(round_univariate: &[Fr], round_challenge: Fr) -> Resu
     }
 
     // Σ u_i / (BARY[i] * (χ - i))
+    #[cfg(feature = "std")]
+    let bary = &*BARY;
+    #[cfg(not(feature = "std"))]
+    let bary = get_bary();
+
     let mut acc = Fr::zero();
     for i in 0..BATCHED_RELATION_PARTIAL_LENGTH {
-        #[cfg(feature = "std")]
-        let bary_val = BARY[i];
-        #[cfg(not(feature = "std"))]
-        let bary_val = get_bary()[i];
-
+        let bary_val = bary[i];
         let denom = bary_val * (round_challenge - Fr::from_u64(i as u64));
-        let inv = denom.inverse().ok_or_else(|| String::from("denom zero"))?;
+        let inv = denom.inverse().ok_or(VerifierError::SumcheckDenomZero)?;
         acc = acc + (round_univariate[i] * inv);
     }
 
@@ -93,7 +86,7 @@ pub fn verify_sumcheck(
     proof: &crate::types::Proof,
     tp: &Transcript,
     vk: &VerificationKey,
-) -> Result<(), String> {
+) -> Result<(), VerifierError> {
     let log_n = vk.log_circuit_size as usize;
     let mut round_target = Fr::zero();
     let mut pow_partial_evaluation = Fr::one();
@@ -103,7 +96,7 @@ pub fn verify_sumcheck(
         let round_univariate = &proof.sumcheck_univariates[round];
 
         if !check_sum(round_univariate, round_target) {
-            return Err("round failed".into());
+            return Err(VerifierError::SumcheckRoundFailed);
         }
 
         let round_challenge = tp.sumcheck_u_challenges[round];
@@ -137,6 +130,6 @@ pub fn verify_sumcheck(
             hex::encode((grand_honk_relation_sum - round_target).to_bytes())
         );
         crate::trace!("======================================");
-        Err("sumcheck final mismatch".into())
+        Err(VerifierError::SumcheckFinalMismatch)
     }
 }
