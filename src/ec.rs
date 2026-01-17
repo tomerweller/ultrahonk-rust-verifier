@@ -1,5 +1,10 @@
 //! BN254 elliptic curve operations for the verifier.
-//! Uses byte-based G1Point directly compatible with Soroban's Bn254G1Affine.
+//! Directly uses Soroban SDK crypto functions.
+
+use soroban_sdk::{
+    crypto::bn254::{Bn254G1Affine, Bn254G2Affine, Fr as HostFr},
+    BytesN, Env, Vec as SorobanVec,
+};
 
 use crate::{error::VerifierError, field::Fr, types::G1Point};
 use crate::types::G2_POINT_SIZE;
@@ -47,8 +52,66 @@ pub const LHS_G2_BYTES: [u8; G2_POINT_SIZE] = [
     0x11, 0xe6, 0xdd, 0x3f, 0x96, 0xe6, 0xce, 0xa2, 0x85, 0x4a, 0x87, 0xd4, 0xda, 0xcc, 0x5e, 0x55,
 ];
 
+/// Multi-scalar multiplication on G1: sum of s_i * C_i
+/// Uses Soroban's g1_mul and g1_add host functions directly.
+#[inline(always)]
+pub fn g1_msm(env: &Env, coms: &[G1Point], scalars: &[Fr]) -> Result<G1Point, VerifierError> {
+    if coms.len() != scalars.len() {
+        return Err(VerifierError::MsmLengthMismatch);
+    }
+
+    let bn = env.crypto().bn254();
+
+    // Soroban does not expose MSM, so use g1_mul plus g1_add in a loop.
+    let mut acc: Option<Bn254G1Affine> = None;
+    for (pt, scalar) in coms.iter().zip(scalars.iter()) {
+        // Convert G1Point bytes directly to Soroban type
+        let host_pt = Bn254G1Affine::from_bytes(BytesN::from_array(env, &pt.bytes));
+        let host_scalar = HostFr::from_bytes(BytesN::from_array(env, &scalar.to_bytes()));
+        let term = bn.g1_mul(&host_pt, &host_scalar);
+        acc = Some(match acc {
+            Some(current) => bn.g1_add(&current, &term),
+            None => term,
+        });
+    }
+
+    match acc {
+        Some(result) => {
+            // Convert result back to G1Point bytes
+            let mut bytes = [0u8; 64];
+            result.to_bytes().copy_into_slice(&mut bytes);
+            Ok(G1Point::from_bytes(bytes))
+        }
+        None => Ok(G1Point::zero()),
+    }
+}
+
+/// Pairing product check e(P0, rhs_g2) * e(P1, lhs_g2) == 1
+/// Uses Soroban's pairing_check host function directly.
+#[inline(always)]
+pub fn pairing_check(env: &Env, p0: &G1Point, p1: &G1Point) -> bool {
+    // Convert G1 points directly from bytes
+    let g1_p0 = Bn254G1Affine::from_bytes(BytesN::from_array(env, &p0.bytes));
+    let g1_p1 = Bn254G1Affine::from_bytes(BytesN::from_array(env, &p1.bytes));
+
+    // Use hardcoded G2 point bytes
+    let g2_rhs = Bn254G2Affine::from_bytes(BytesN::from_array(env, &RHS_G2_BYTES));
+    let g2_lhs = Bn254G2Affine::from_bytes(BytesN::from_array(env, &LHS_G2_BYTES));
+
+    let mut g1_points = SorobanVec::new(env);
+    g1_points.push_back(g1_p0);
+    g1_points.push_back(g1_p1);
+
+    let mut g2_points = SorobanVec::new(env);
+    g2_points.push_back(g2_rhs);
+    g2_points.push_back(g2_lhs);
+
+    env.crypto().bn254().pairing_check(g1_points, g2_points)
+}
+
 /// Negate a G1 point by computing -y mod p (the BN254 base field modulus).
 /// For the zero point (all zeros), returns the zero point unchanged.
+/// This is pure math - no Soroban calls needed.
 #[inline(always)]
 pub fn negate(pt: &G1Point) -> G1Point {
     let mut result = pt.bytes;
@@ -95,107 +158,6 @@ fn sub_mod(a: &[u8; 32], b: &[u8]) -> [u8; 32] {
     result
 }
 
-/// Trait for BN254 operations used by the verifier hot paths.
-/// The implementation bridges MSM/pairing to Soroban BN254 precompiles.
-pub trait Bn254Ops {
-    fn g1_msm(&self, coms: &[G1Point], scalars: &[Fr]) -> Result<G1Point, VerifierError>;
-    fn pairing_check(&self, p0: &G1Point, p1: &G1Point) -> bool;
-}
-
-// ============================================================================
-// Soroban static backend (no allocator, no Box)
-// ============================================================================
-
-#[cfg(feature = "soroban-precompile")]
-mod soroban_backend {
-    use super::*;
-    use core::cell::UnsafeCell;
-    use core::sync::atomic::{AtomicBool, Ordering};
-
-    /// Static storage for Soroban backend function pointers
-    struct SorobanBackend {
-        initialized: AtomicBool,
-        // Function pointers instead of trait objects
-        msm_fn: UnsafeCell<Option<fn(&[G1Point], &[Fr]) -> Result<G1Point, VerifierError>>>,
-        pairing_fn: UnsafeCell<Option<fn(&G1Point, &G1Point) -> bool>>,
-    }
-
-    unsafe impl Sync for SorobanBackend {}
-
-    static SOROBAN_BACKEND: SorobanBackend = SorobanBackend {
-        initialized: AtomicBool::new(false),
-        msm_fn: UnsafeCell::new(None),
-        pairing_fn: UnsafeCell::new(None),
-    };
-
-    pub fn set_soroban_backend(
-        msm_fn: fn(&[G1Point], &[Fr]) -> Result<G1Point, VerifierError>,
-        pairing_fn: fn(&G1Point, &G1Point) -> bool,
-    ) {
-        unsafe {
-            *SOROBAN_BACKEND.msm_fn.get() = Some(msm_fn);
-            *SOROBAN_BACKEND.pairing_fn.get() = Some(pairing_fn);
-        }
-        SOROBAN_BACKEND.initialized.store(true, Ordering::Release);
-    }
-
-    #[inline(always)]
-    pub fn is_initialized() -> bool {
-        SOROBAN_BACKEND.initialized.load(Ordering::Acquire)
-    }
-
-    #[inline(always)]
-    pub fn call_msm(coms: &[G1Point], scalars: &[Fr]) -> Result<G1Point, VerifierError> {
-        unsafe {
-            if let Some(f) = *SOROBAN_BACKEND.msm_fn.get() {
-                f(coms, scalars)
-            } else {
-                Err(VerifierError::EcBackendNotInitialized)
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub fn call_pairing(p0: &G1Point, p1: &G1Point) -> bool {
-        unsafe {
-            if let Some(f) = *SOROBAN_BACKEND.pairing_fn.get() {
-                f(p0, p1)
-            } else {
-                false
-            }
-        }
-    }
-}
-
-/// Multi-scalar multiplication on G1: sum of s_i * C_i
-/// Returns a G1Point (64 bytes, directly compatible with Soroban).
-#[inline(always)]
-pub fn g1_msm(coms: &[G1Point], scalars: &[Fr]) -> Result<G1Point, VerifierError> {
-    #[cfg(feature = "soroban-precompile")]
-    {
-        if soroban_backend::is_initialized() {
-            return soroban_backend::call_msm(coms, scalars);
-        }
-    }
-    // If no backend is initialized, return an error
-    // (Soroban-only mode: no fallback to arkworks)
-    Err(VerifierError::EcBackendNotInitialized)
-}
-
-/// Pairing product check e(P0, rhs_g2) * e(P1, lhs_g2) == 1
-/// Takes G1Points directly (64 bytes each).
-#[inline(always)]
-pub fn pairing_check(p0: &G1Point, p1: &G1Point) -> bool {
-    #[cfg(feature = "soroban-precompile")]
-    {
-        if soroban_backend::is_initialized() {
-            return soroban_backend::call_pairing(p0, p1);
-        }
-    }
-    // If no backend is initialized, return false
-    false
-}
-
 /// Helper functions for EC operations
 pub mod helpers {
     use super::*;
@@ -206,6 +168,3 @@ pub mod helpers {
         super::negate(pt)
     }
 }
-
-#[cfg(feature = "soroban-precompile")]
-pub use soroban_backend::set_soroban_backend;

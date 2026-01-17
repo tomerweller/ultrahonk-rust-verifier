@@ -1,5 +1,7 @@
 //! UltraHonk verifier (no heap allocation)
 
+use soroban_sdk::Env;
+
 use crate::{
     error::VerifierError,
     field::Fr,
@@ -31,6 +33,7 @@ impl UltraHonkVerifier {
     /// Top-level verify
     pub fn verify(
         &self,
+        env: &Env,
         proof_bytes: &[u8],
         public_inputs_bytes: &[u8],
     ) -> Result<(), VerifierError> {
@@ -55,6 +58,7 @@ impl UltraHonkVerifier {
         let pis_total = provided + PAIRING_POINTS_SIZE as u64;
         let pub_inputs_offset = 1;
         let mut t = generate_transcript(
+            env,
             &proof,
             public_inputs_bytes,
             self.vk.circuit_size,
@@ -76,7 +80,7 @@ impl UltraHonkVerifier {
         verify_sumcheck(&proof, &t, &self.vk)?;
 
         // 6) Shplonk
-        verify_shplemini(&proof, &self.vk, &t)?;
+        verify_shplemini(env, &proof, &self.vk, &t)?;
 
         Ok(())
     }

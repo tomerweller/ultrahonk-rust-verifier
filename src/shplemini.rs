@@ -1,6 +1,8 @@
 //! Shplemini batch-opening verifier for BN254 (no heap allocation)
-use crate::ec::helpers::negate;
-use crate::ec::{g1_msm, pairing_check};
+
+use soroban_sdk::Env;
+
+use crate::ec::{g1_msm, negate, pairing_check};
 use crate::error::VerifierError;
 use crate::field::Fr;
 use crate::trace;
@@ -19,6 +21,7 @@ const SHPLEMINI_TOTAL_SIZE: usize = 1 + NUMBER_OF_ENTITIES + CONST_PROOF_SIZE_LO
 
 /// Shplemini verification
 pub fn verify_shplemini(
+    env: &Env,
     proof: &Proof,
     vk: &VerificationKey,
     tp: &Transcript,
@@ -203,9 +206,9 @@ pub fn verify_shplemini(
     scalars[q_idx] = tp.shplonk_z;
 
     // 12) MSM + pairing
-    let p0 = g1_msm(&coms[..total], &scalars[..total])?;
+    let p0 = g1_msm(env, &coms[..total], &scalars[..total])?;
     let p1 = negate(&proof.kzg_quotient);
-    if pairing_check(&p0, &p1) {
+    if pairing_check(env, &p0, &p1) {
         Ok(())
     } else {
         Err(VerifierError::ShplonkPairingFailed)

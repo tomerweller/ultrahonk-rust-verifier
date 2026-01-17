@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 license     = "MIT"
-description = "Rust verifier for UltraHonk proofs"
+description = "Rust verifier for UltraHonk proofs - Soroban native"
 repository  = "https://github.com/yugocabrio/ultrahonk-rust-verifier"
 
 [dependencies]
-sha3 = { version = "0.10", default-features = false }
+# Soroban SDK for native crypto operations
+soroban-sdk = { git = "https://github.com/stellar/rs-soroban-sdk", tag = "v25.0.0-rc.1", default-features = false }
 
 # Only ark-ff and ark-bn254 needed for Fr scalar field arithmetic
 ark-ff = { version = "0.5", default-features = false }
@@ -18,18 +19,12 @@ serde = { version = "1.0", features = ["derive"], default-features = false, opti
 serde_json = { version = "1.0", default-features = false, features = ["alloc"], optional = true }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
-lazy_static = { version = "1.4", optional = true }
-
 [features]
 default = []
-# Soroban BN254 precompile integration switch (no allocator needed)
-soroban-precompile = []
 std = [
-    "sha3/std",
     "ark-ff/std",
     "ark-bn254/std",
     "hex/std",
-    "lazy_static",
     "alloc",
 ]
 trace = []

@@ -1,5 +1,7 @@
 //! Fiat–Shamir transcript for UltraHonk (no heap allocation)
 
+use soroban_sdk::Env;
+
 use crate::trace;
 use crate::{
     field::Fr,
@@ -61,8 +63,8 @@ fn split_challenge(challenge: Fr) -> (Fr, Fr) {
 }
 
 #[inline(always)]
-fn hash_to_fr(bytes: &[u8]) -> Fr {
-    Fr::from_bytes(&hash32(bytes))
+fn hash_to_fr(env: &Env, bytes: &[u8]) -> Fr {
+    Fr::from_bytes(&hash32(env, bytes))
 }
 
 fn u64_to_be32(x: u64) -> [u8; 32] {
@@ -72,6 +74,7 @@ fn u64_to_be32(x: u64) -> [u8; 32] {
 }
 
 fn generate_eta_challenge(
+    env: &Env,
     proof: &Proof,
     public_inputs: &[u8],
     circuit_size: u64,
@@ -94,15 +97,15 @@ fn generate_eta_challenge(
         push_point(&mut data, w);
     }
 
-    let previous_challenge = hash_to_fr(data.as_slice());
+    let previous_challenge = hash_to_fr(env, data.as_slice());
     let (eta, eta_two) = split_challenge(previous_challenge);
-    let previous_challenge = hash_to_fr(&previous_challenge.to_bytes());
+    let previous_challenge = hash_to_fr(env, &previous_challenge.to_bytes());
     let (eta_three, _) = split_challenge(previous_challenge);
 
     (eta, eta_two, eta_three, previous_challenge)
 }
 
-fn generate_beta_and_gamma_challenges(previous_challenge: Fr, proof: &Proof) -> (Fr, Fr, Fr) {
+fn generate_beta_and_gamma_challenges(env: &Env, previous_challenge: Fr, proof: &Proof) -> (Fr, Fr, Fr) {
     let mut data = TranscriptBuf::new();
     data.extend(&previous_challenge.to_bytes());
     for w in &[
@@ -112,12 +115,13 @@ fn generate_beta_and_gamma_challenges(previous_challenge: Fr, proof: &Proof) -> 
     ] {
         push_point(&mut data, w);
     }
-    let next_previous_challenge = hash_to_fr(data.as_slice());
+    let next_previous_challenge = hash_to_fr(env, data.as_slice());
     let (beta, gamma) = split_challenge(next_previous_challenge);
     (beta, gamma, next_previous_challenge)
 }
 
 fn generate_alpha_challenges(
+    env: &Env,
     previous_challenge: Fr,
     proof: &Proof,
 ) -> ([Fr; NUMBER_OF_ALPHAS], Fr) {
@@ -126,7 +130,7 @@ fn generate_alpha_challenges(
     for w in &[&proof.lookup_inverses, &proof.z_perm] {
         push_point(&mut data, w);
     }
-    let mut next_previous_challenge = hash_to_fr(data.as_slice());
+    let mut next_previous_challenge = hash_to_fr(env, data.as_slice());
 
     let mut alphas = [Fr::zero(); NUMBER_OF_ALPHAS];
     let (a0, a1) = split_challenge(next_previous_challenge);
@@ -134,14 +138,14 @@ fn generate_alpha_challenges(
     alphas[1] = a1;
 
     for i in 1..(NUMBER_OF_ALPHAS / 2) {
-        next_previous_challenge = hash_to_fr(&next_previous_challenge.to_bytes());
+        next_previous_challenge = hash_to_fr(env, &next_previous_challenge.to_bytes());
         let (lo, hi) = split_challenge(next_previous_challenge);
         alphas[2 * i] = lo;
         alphas[2 * i + 1] = hi;
     }
 
     if (NUMBER_OF_ALPHAS & 1) == 1 && NUMBER_OF_ALPHAS > 2 {
-        next_previous_challenge = hash_to_fr(&next_previous_challenge.to_bytes());
+        next_previous_challenge = hash_to_fr(env, &next_previous_challenge.to_bytes());
         let (last, _) = split_challenge(next_previous_challenge);
         alphas[NUMBER_OF_ALPHAS - 1] = last;
     }
@@ -150,6 +154,7 @@ fn generate_alpha_challenges(
 }
 
 fn generate_relation_parameters_challenges(
+    env: &Env,
     proof: &Proof,
     public_inputs: &[u8],
     circuit_size: u64,
@@ -157,6 +162,7 @@ fn generate_relation_parameters_challenges(
     pub_inputs_offset: u64,
 ) -> (RelationParameters, Fr) {
     let (eta, eta_two, eta_three, previous_challenge) = generate_eta_challenge(
+        env,
         proof,
         public_inputs,
         circuit_size,
@@ -164,7 +170,7 @@ fn generate_relation_parameters_challenges(
         pub_inputs_offset,
     );
     let (beta, gamma, next_previous_challenge) =
-        generate_beta_and_gamma_challenges(previous_challenge, proof);
+        generate_beta_and_gamma_challenges(env, previous_challenge, proof);
     let rp = RelationParameters {
         eta,
         eta_two,
@@ -176,17 +182,18 @@ fn generate_relation_parameters_challenges(
     (rp, next_previous_challenge)
 }
 
-fn generate_gate_challenges(previous_challenge: Fr) -> ([Fr; CONST_PROOF_SIZE_LOG_N], Fr) {
+fn generate_gate_challenges(env: &Env, previous_challenge: Fr) -> ([Fr; CONST_PROOF_SIZE_LOG_N], Fr) {
     let mut next_previous_challenge = previous_challenge;
     let mut gate_challenges = [Fr::zero(); CONST_PROOF_SIZE_LOG_N];
     for i in 0..CONST_PROOF_SIZE_LOG_N {
-        next_previous_challenge = hash_to_fr(&next_previous_challenge.to_bytes());
+        next_previous_challenge = hash_to_fr(env, &next_previous_challenge.to_bytes());
         gate_challenges[i] = split_challenge(next_previous_challenge).0;
     }
     (gate_challenges, next_previous_challenge)
 }
 
 fn generate_sumcheck_challenges(
+    env: &Env,
     proof: &Proof,
     previous_challenge: Fr,
 ) -> ([Fr; CONST_PROOF_SIZE_LOG_N], Fr) {
@@ -198,55 +205,56 @@ fn generate_sumcheck_challenges(
         for &c in proof.sumcheck_univariates[r].iter() {
             data.extend(&c.to_bytes());
         }
-        next_previous_challenge = hash_to_fr(data.as_slice());
+        next_previous_challenge = hash_to_fr(env, data.as_slice());
         sumcheck_challenges[r] = split_challenge(next_previous_challenge).0;
     }
     (sumcheck_challenges, next_previous_challenge)
 }
 
-fn generate_rho_challenge(proof: &Proof, previous_challenge: Fr) -> (Fr, Fr) {
+fn generate_rho_challenge(env: &Env, proof: &Proof, previous_challenge: Fr) -> (Fr, Fr) {
     let mut data = TranscriptBuf::new();
     data.extend(&previous_challenge.to_bytes());
     for &e in proof.sumcheck_evaluations.iter() {
         data.extend(&e.to_bytes());
     }
-    let next_previous_challenge = hash_to_fr(data.as_slice());
+    let next_previous_challenge = hash_to_fr(env, data.as_slice());
     let rho = split_challenge(next_previous_challenge).0;
     (rho, next_previous_challenge)
 }
 
-fn generate_gemini_r_challenge(proof: &Proof, previous_challenge: Fr) -> (Fr, Fr) {
+fn generate_gemini_r_challenge(env: &Env, proof: &Proof, previous_challenge: Fr) -> (Fr, Fr) {
     let mut data = TranscriptBuf::new();
     data.extend(&previous_challenge.to_bytes());
     for pt in proof.gemini_fold_comms.iter() {
         push_point(&mut data, pt);
     }
-    let next_previous_challenge = hash_to_fr(data.as_slice());
+    let next_previous_challenge = hash_to_fr(env, data.as_slice());
     let gemini_r = split_challenge(next_previous_challenge).0;
     (gemini_r, next_previous_challenge)
 }
 
-fn generate_shplonk_nu_challenge(proof: &Proof, previous_challenge: Fr) -> (Fr, Fr) {
+fn generate_shplonk_nu_challenge(env: &Env, proof: &Proof, previous_challenge: Fr) -> (Fr, Fr) {
     let mut data = TranscriptBuf::new();
     data.extend(&previous_challenge.to_bytes());
     for &a in proof.gemini_a_evaluations.iter() {
         data.extend(&a.to_bytes());
     }
-    let next_previous_challenge = hash_to_fr(data.as_slice());
+    let next_previous_challenge = hash_to_fr(env, data.as_slice());
     let shplonk_nu = split_challenge(next_previous_challenge).0;
     (shplonk_nu, next_previous_challenge)
 }
 
-fn generate_shplonk_z_challenge(proof: &Proof, previous_challenge: Fr) -> (Fr, Fr) {
+fn generate_shplonk_z_challenge(env: &Env, proof: &Proof, previous_challenge: Fr) -> (Fr, Fr) {
     let mut data = TranscriptBuf::new();
     data.extend(&previous_challenge.to_bytes());
     push_point(&mut data, &proof.shplonk_q);
-    let next_previous_challenge = hash_to_fr(data.as_slice());
+    let next_previous_challenge = hash_to_fr(env, data.as_slice());
     let shplonk_z = split_challenge(next_previous_challenge).0;
     (shplonk_z, next_previous_challenge)
 }
 
 pub fn generate_transcript(
+    env: &Env,
     proof: &Proof,
     public_inputs: &[u8],
     circuit_size: u64,
@@ -255,6 +263,7 @@ pub fn generate_transcript(
 ) -> Transcript {
     // 1) eta/beta/gamma
     let (rp, previous_challenge) = generate_relation_parameters_challenges(
+        env,
         proof,
         public_inputs,
         circuit_size,
@@ -263,25 +272,25 @@ pub fn generate_transcript(
     );
 
     // 2) alphas
-    let (alphas, previous_challenge) = generate_alpha_challenges(previous_challenge, proof);
+    let (alphas, previous_challenge) = generate_alpha_challenges(env, previous_challenge, proof);
 
     // 3) gate challenges
-    let (gate_chals, previous_challenge) = generate_gate_challenges(previous_challenge);
+    let (gate_chals, previous_challenge) = generate_gate_challenges(env, previous_challenge);
 
     // 4) sumcheck challenges
-    let (u_chals, previous_challenge) = generate_sumcheck_challenges(proof, previous_challenge);
+    let (u_chals, previous_challenge) = generate_sumcheck_challenges(env, proof, previous_challenge);
 
     // 5) rho
-    let (rho, previous_challenge) = generate_rho_challenge(proof, previous_challenge);
+    let (rho, previous_challenge) = generate_rho_challenge(env, proof, previous_challenge);
 
     // 6) gemini_r
-    let (gemini_r, previous_challenge) = generate_gemini_r_challenge(proof, previous_challenge);
+    let (gemini_r, previous_challenge) = generate_gemini_r_challenge(env, proof, previous_challenge);
 
     // 7) shplonk_nu
-    let (shplonk_nu, previous_challenge) = generate_shplonk_nu_challenge(proof, previous_challenge);
+    let (shplonk_nu, previous_challenge) = generate_shplonk_nu_challenge(env, proof, previous_challenge);
 
     // 8) shplonk_z
-    let (shplonk_z, _previous_challenge) = generate_shplonk_z_challenge(proof, previous_challenge);
+    let (shplonk_z, _previous_challenge) = generate_shplonk_z_challenge(env, proof, previous_challenge);
 
     trace!("===== TRANSCRIPT PARAMETERS =====");
     trace!("eta = 0x{}", hex::encode(rp.eta.to_bytes()));
